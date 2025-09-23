@@ -1,9 +1,7 @@
 # Entornos virtuales
-.venv/
-venv/
 benchmarking/
 
-# Archivos de Python
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -18,10 +16,9 @@ __pycache__/
 *.swp
 *.swo
 
-# Resultados de benchmark
-/out/
-*.csv
-*.jsonl
+# Resultados de benchmark (solo en out/)
+out/
+out/**
 
 # Archivos temporales
 .DS_Store
