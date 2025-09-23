@@ -1,0 +1,32 @@
+# Entornos virtuales
+.venv/
+venv/
+benchmarking/
+
+# Archivos de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.egg-info/
+*.egg
+*.log
+
+# Configuración local
+.env
+*.swp
+*.swo
+
+# Resultados de benchmark
+/out/
+*.csv
+*.jsonl
+
+# Archivos temporales
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
