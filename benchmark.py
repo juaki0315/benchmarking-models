@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 import requests
 from sentence_transformers import SentenceTransformer, util
-
+from llm_judge import llm_judge_pointwise_ollama, build_judge_signals
 
 # =========================
 #   Dataclasses de esquema
@@ -20,7 +20,7 @@ class GoldenSpec:
     required: List[str] = field(default_factory=list)
     optional: List[str] = field(default_factory=list)
     forbidden: List[str] = field(default_factory=list)
-    order_constraints: List[Tuple[str, str]] = field(default_factory=list)  # pares (A va antes que B)
+    order_constraints: List[Tuple[str, str]] = field(default_factory=list)
     equivalences: Dict[str, List[str]] = field(default_factory=dict)
     vendor: Optional[str] = None
     explanation_ref: Optional[str] = None
@@ -42,7 +42,6 @@ class Item:
 # ==================================
 
 def normalize_line(s: str) -> str:
-    """Minúsculas, colapsar espacios, recortar y quitar prompts CLI (R1#, >, etc.)."""
     s = s.strip().lower()
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"^\S+[>#]\s*", "", s)
@@ -50,7 +49,6 @@ def normalize_line(s: str) -> str:
 
 
 def apply_equivalences(text: str, equivalences: Dict[str, List[str]]) -> str:
-    """Reemplaza alias por la forma canónica (clave del dict)."""
     text_norm = text
     for canonical, aliases in equivalences.items():
         for alias in aliases:
@@ -87,7 +85,6 @@ def f1_score(tp: int, fp: int, fn: int) -> float:
 
 IPV4_RE = r"(?:\d{1,3}\.){3}\d{1,3}"
 ASN_RE = r"\d{1,6}"
-# Interfaz Cisco genérica (Gi/Fa/Te/Eth... y hasta 4 niveles de /)
 INTF_RE = r"(?:gi|gigabitethernet|fa|fastethernet|te|tengigabitethernet|eth|ethernet)\s*\d+(?:/\d+){0,3}"
 
 PLACEHOLDER_MAP = {
@@ -99,7 +96,6 @@ PLACEHOLDER_MAP = {
 }
 
 def expand_placeholders(pattern: str) -> str:
-    """Sustituye placeholders <IP>, <ASN>, etc. por regex listas para usar."""
     out = pattern
     for ph, rx in PLACEHOLDER_MAP.items():
         out = out.replace(ph, rx)
@@ -113,22 +109,18 @@ def expand_placeholders(pattern: str) -> str:
 # ======================
 
 def evaluate_cli(expected: GoldenSpec, cli_text: str) -> Dict[str, Any]:
-    # 1) Normalización + equivalencias
     cli_text_eq = apply_equivalences(cli_text.lower(), expected.equivalences)
     lines = text_to_lines(cli_text_eq)
 
-    # 2) Expandir placeholders en los patrones del golden
     required_expanded  = [expand_placeholders(pat) for pat in expected.required]
     optional_expanded  = [expand_placeholders(pat) for pat in expected.optional] if expected.optional else []
     forbidden_expanded = [expand_placeholders(pat) for pat in expected.forbidden] if expected.forbidden else []
     order_expanded     = [[expand_placeholders(a), expand_placeholders(b)] for (a, b) in expected.order_constraints] if expected.order_constraints else []
 
-    # 3) Matching
     req_hits = regex_hits(required_expanded, lines)
     opt_hits = regex_hits(optional_expanded, lines) if optional_expanded else []
     forb_hits = regex_hits(forbidden_expanded, lines) if forbidden_expanded else []
 
-    # 4) TP/FN/FP
     tp = sum(req_hits)
     fn = len(required_expanded) - tp
     allowed_any = [re.compile(p) for p in (required_expanded + optional_expanded)]
@@ -141,12 +133,10 @@ def evaluate_cli(expected: GoldenSpec, cli_text: str) -> Dict[str, Any]:
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     f1 = f1_score(tp, fp, fn)
 
-    # 5) Riesgo (forbidden)
     forbidden_count = sum(forb_hits)
     risk_penalty = min(1.0, forbidden_count / max(1, len(forbidden_expanded))) if forbidden_expanded else 0.0
     risk_score = 1.0 - risk_penalty
 
-    # 6) Orden (constraints A antes que B)
     order_ok_list = []
     if order_expanded:
         for A, B in order_expanded:
@@ -180,112 +170,28 @@ def semantic_similarity(ref_text: str, hyp_text: str, model_name: str = "sentenc
     model = SentenceTransformer(model_name)
     emb = model.encode([ref_text or "", hyp_text or ""], convert_to_tensor=True, normalize_embeddings=True)
     sim = float(util.cos_sim(emb[0], emb[1]).cpu().item())
-    return (sim + 1) / 2  # normalizar [-1,1] -> [0,1]
+    return (sim + 1) / 2
 
 
 # ==========================
-#   LLM juez (Ollama)
+#   LLM juez (pointwise)
 # ==========================
-
-def llm_judge_ollama(
-    question: str,
-    expected_cli: str,
-    expected_expl: str,
-    model_cli: str,
-    model_expl: str,
-    model_name: str = "qwen3:8b",
-    host: str = "http://localhost:11434",
-    temperature: float = 0.0,
-) -> Dict[str, Any]:
-    """Evalúa con un LLM local vía Ollama. Requiere `ollama serve` y `ollama pull <modelo>`."""
-    system = (
-        "Eres un evaluador MUY estricto de respuestas de redes/telecom. "
-        "Responde SOLO con JSON válido. No añadas texto adicional."
-    )
-
-    rubric = """
-Rúbrica (0–5, enteros). 5 es raro y solo si es perfecto:
-- EXACTITUD: 5 si no hay errores técnicos; 4 si hay leves; 3 si hay algún error moderado; 2 si varios; 1 si mayormente incorrecto; 0 si incorrecto/dañino.
-- COBERTURA: 5 si cubre TODOS los puntos clave; 4 si falta un detalle menor; 3 si faltan varias piezas; 2 si cubre <50%; 1 si casi nada; 0 si nada.
-- CLARIDAD: 5 si es clara y bien estructurada; 4 si algo prolija; 3 si se entiende con esfuerzo; 2 si confusa; 1 muy confusa; 0 incomprensible.
-- COHERENCIA: 5 si explicación y CLI están totalmente alineadas; 3 si hay incongruencias moderadas; 1–2 si fuertes; 0 si se contradicen.
-No otorgues 5 si no cumple exactamente lo anterior. El 3 debe ser la nota “normal” para respuestas decentes con fallos.
-"""
-
-    prompt = f"""
-{rubric}
-
-[Pregunta]
-{question}
-
-[Referencia (puntos clave esperados)]
-CLI:
-{expected_cli}
-
-Explicación:
-{expected_expl}
-
-[Respuesta del modelo]
-CLI:
-{model_cli}
-
-Explicación:
-{model_expl}
-
-Devuelve SOLO este JSON (enteros 0–5):
-{{"exactitud": X, "cobertura": Y, "claridad": Z, "coherencia": W, "comentario": "frase breve del porqué"}}
-"""
-
-    payload = {
-        "model": model_name,
-        "prompt": prompt,
-        "system": system,
-        "format": "json",              # Fuerza salida JSON pura
-        "options": {"temperature": temperature},
-        "stream": False,
-    }
-    url = f"{host}/api/generate"
-    resp = requests.post(url, json=payload, timeout=120)
-    resp.raise_for_status()
-    data = resp.json()
-    text = data.get("response", "").strip()
-
-    try:
-        scores = json.loads(text)
-    except Exception:
-        scores = {"exactitud": None, "cobertura": None, "claridad": None, "coherencia": None, "comentario": text}
-
-    # saneado: clamp y enteros
-    for k in ["exactitud", "cobertura", "claridad", "coherencia"]:
-        if isinstance(scores.get(k), (int, float)):
-            v = int(round(scores[k]))
-            scores[k] = max(0, min(5, v))
-        else:
-            scores[k] = None
-    return scores
-
 
 def postprocess_llm_scores(llm_scores: Optional[Dict[str, Any]], cli_metrics: Dict[str, Any], sem_sim: Optional[float]) -> Optional[Dict[str, Any]]:
-    """Ajusta las notas del LLM para no 'maquillar' resultados pobres de CLI/semántica."""
     if not isinstance(llm_scores, dict):
         return llm_scores
-
-    # Solo si hay números
     for k in ["exactitud", "cobertura", "claridad", "coherencia"]:
         v = llm_scores.get(k)
         if v is not None:
             v = int(round(v))
             v = max(0, min(5, v))
             llm_scores[k] = v
-
-    # Penalizaciones suaves (cap a 3) cuando hay señales malas objetivas
     if cli_metrics.get("f1", 0.0) < 0.8 and llm_scores.get("exactitud") is not None:
         llm_scores["exactitud"] = min(llm_scores["exactitud"], 3)
     if sem_sim is not None and sem_sim < 0.7 and llm_scores.get("cobertura") is not None:
         llm_scores["cobertura"] = min(llm_scores["cobertura"], 3)
     if cli_metrics.get("risk_score", 1.0) < 1.0 and llm_scores.get("coherencia") is not None:
         llm_scores["coherencia"] = min(llm_scores["coherencia"], 3)
-
     return llm_scores
 
 
@@ -298,24 +204,10 @@ def compute_overall_score(
     sem_sim: Optional[float],
     llm_scores: Optional[Dict[str, Any]]
 ) -> float:
-    """
-    Calcula el score global con pesos fijos:
-      - 0.45 CLI (F1 + orden)
-      - 0.25 semántica
-      - 0.10 riesgo
-      - 0.20 juez LLM
-    """
-
-    # Bloque CLI: mezcla F1 y orden
     cli_block = 0.7 * cli_metrics["f1"] + 0.3 * cli_metrics["order_score"]
-
-    # Bloque semántica
     sem_block = sem_sim if sem_sim is not None else 0.0
-
-    # Bloque riesgo
     risk_block = cli_metrics["risk_score"]
 
-    # Score del juez LLM
     llm_avg = 0.0
     if llm_scores and all(
         llm_scores.get(k) is not None
@@ -328,7 +220,6 @@ def compute_overall_score(
             llm_scores["coherencia"],
         ]) / 5.0
 
-    # Mezcla final con pesos fijos
     overall = (
         0.45 * cli_block +
         0.25 * sem_block +
@@ -350,8 +241,15 @@ def main():
     parser.add_argument("--semantic", action="store_true", help="Calcular similitud semántica (sentence-transformers).")
     parser.add_argument("--semantic-model", default="sentence-transformers/all-MiniLM-L6-v2", help="Modelo de embeddings.")
     parser.add_argument("--use-llm", action="store_true", help="Usar LLM local vía Ollama como juez.")
-    parser.add_argument("--llm-model", default="qwen3:8b", help="Modelo Ollama (p.ej., qwen3:8b, mistral, llama3.1:8b-instruct).")
+    parser.add_argument("--llm-model", default="mistral", help="Modelo Ollama (p.ej. mistral, llama3.1:8b-instruct).")
     parser.add_argument("--ollama-host", default="http://localhost:11434", help="Host de Ollama (por defecto localhost:11434).")
+
+    # FLAGS SOLO POINTWISE
+    parser.add_argument("--llm-samples", type=int, default=3, help="Veces que se consulta al juez (self-consistency).")
+    parser.add_argument("--llm-agg", choices=["median", "mean"], default="median", help="Agregación de notas.")
+    parser.add_argument("--llm-include-signals", action="store_true", help="Pasa señales objetivas (required/forbidden/orden) al juez.")
+    parser.add_argument("--llm-secondary-model", default=None, help="Segundo modelo de juez para chequear acuerdo (opcional).")
+
     args = parser.parse_args()
 
     rows = []
@@ -391,11 +289,13 @@ def main():
             if args.semantic and item.expected.explanation_ref:
                 sem_sim = semantic_similarity(item.expected.explanation_ref, item.model_answer_expl, args.semantic_model)
 
-            # --- LLM juez (opcional) ---
+            # --- LLM juez pointwise (opcional) ---
             llm_scores = None
             if args.use_llm:
                 try:
-                    llm_scores = llm_judge_ollama(
+                    signals = build_judge_signals(cli_metrics, item.expected) if args.llm_include_signals else None
+
+                    llm_scores = llm_judge_pointwise_ollama(
                         question=item.question,
                         expected_cli="\n".join(item.expected.required),
                         expected_expl=item.expected.explanation_ref or "",
@@ -403,11 +303,37 @@ def main():
                         model_expl=item.model_answer_expl,
                         model_name=args.llm_model,
                         host=args.ollama_host,
+                        temperature=0.3,
+                        samples=max(1, args.llm_samples),
+                        agg=args.llm_agg,
+                        signals=signals,
                     )
+
+                    # (opcional) segundo juez para acuerdo inter-modelo
+                    if args.llm_secondary_model:
+                        second = llm_judge_pointwise_ollama(
+                            question=item.question,
+                            expected_cli="\n".join(item.expected.required),
+                            expected_expl=item.expected.explanation_ref or "",
+                            model_cli=item.model_answer_cli,
+                            model_expl=item.model_answer_expl,
+                            model_name=args.llm_secondary_model,
+                            host=args.ollama_host,
+                            temperature=0.3,
+                            samples=max(1, args.llm_samples),
+                            agg=args.llm_agg,
+                            signals=signals,
+                        )
+                        for k in ["exactitud", "cobertura", "claridad", "coherencia"]:
+                            a, b = llm_scores.get(k), second.get(k)
+                            if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                                llm_scores[k] = int(round((a + b) / 2))
+                        llm_scores["comentario"] = (llm_scores.get("comentario", "") or "")[:120]
+
                 except Exception as e:
                     llm_scores = {"error": str(e)}
 
-            # Post-proceso del juez (cap de notas si CLI/semántica flojos)
+            # Post-proceso del juez
             llm_scores = postprocess_llm_scores(llm_scores, cli_metrics, sem_sim)
 
             overall = compute_overall_score(cli_metrics, sem_sim, llm_scores if isinstance(llm_scores, dict) else None)

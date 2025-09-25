@@ -11,7 +11,29 @@ if [ ! -f "$DATA_PATH" ]; then
   exit 1
 fi
 
-python benchmark_cli_nlp.py --data "$DATA_PATH" --semantic --use-llm --llm-model qwen3:8b --out_csv "$OUT_CSV" --out_details "$OUT_DETAILS" || {
-  echo "Intento sin LLM (Ollama no disponible?)"
-  python benchmark_cli_nlp.py --data "$DATA_PATH" --semantic --out_csv "$OUT_CSV" --out_details "$OUT_DETAILS"
-}
+echo "=== Benchmark IA (pointwise LLM judge) ==="
+echo "Dataset: $DATA_PATH"
+echo "Salida CSV: $OUT_CSV"
+echo "Salida JSONL: $OUT_DETAILS"
+
+# Primer intento: con LLM juez
+if python benchmark.py \
+    --data "$DATA_PATH" \
+    --semantic \
+    --use-llm \
+    --llm-model mistral \
+    --llm-samples 3 \
+    --llm-agg median \
+    --llm-include-signals \
+    --out_csv "$OUT_CSV" \
+    --out_details "$OUT_DETAILS"; then
+  echo ">>> Benchmark completado con LLM juez"
+else
+  echo ">>> Ollama no disponible o fallo en el LLM. Reintentando sin juez..."
+  python benchmark.py \
+    --data "$DATA_PATH" \
+    --semantic \
+    --out_csv "$OUT_CSV" \
+    --out_details "$OUT_DETAILS"
+  echo ">>> Benchmark completado SIN LLM juez"
+fi
